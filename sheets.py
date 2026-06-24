@@ -8,7 +8,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-ATT_HEADERS = ["Telegram ID", "Ism Familiya", "Holat", "Sana", "Vaqt"]
+ATT_HEADERS = ["Telegram ID", "Ism Familiya", "Holat", "Filial", "Masofa (m)", "Sana", "Vaqt"]
 EMP_HEADERS = ["Telegram ID", "Ism", "Familiya", "Lavozim", "Telefon", "Ro'yxatdan o'tgan sana"]
 
 
@@ -24,16 +24,22 @@ class Sheets:
         try:
             ws = self.sh.worksheet(title)
         except gspread.WorksheetNotFound:
-            ws = self.sh.add_worksheet(title=title, rows=1000, cols=len(headers))
+            ws = self.sh.add_worksheet(title=title, rows=1000, cols=max(len(headers), 10))
             ws.append_row(headers)
             return ws
-        if not ws.row_values(1):
-            ws.append_row(headers)
+        # Sarlavhalar mos kelmasa (masalan yangi ustun qo'shilgan bo'lsa) — yangilaymiz
+        current = ws.row_values(1)
+        if current != headers:
+            if ws.col_count < len(headers):
+                ws.add_cols(len(headers) - ws.col_count)
+            ws.update([headers], "A1")
         return ws
 
     # --- Davomat ---
-    def add_attendance(self, tg_id, full_name, status, date, time):
-        self.attendance.append_row([str(tg_id), full_name, status, date, time])
+    def add_attendance(self, tg_id, full_name, status, branch, distance, date, time):
+        self.attendance.append_row(
+            [str(tg_id), full_name, status, branch, str(distance), date, time]
+        )
 
     def get_today_attendance(self, date):
         return [r for r in self.attendance.get_all_records() if str(r.get("Sana")) == date]
