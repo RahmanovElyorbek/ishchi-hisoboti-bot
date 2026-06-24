@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from math import radians, sin, cos, asin, sqrt
 from zoneinfo import ZoneInfo
 
@@ -41,12 +41,12 @@ TZ = ZoneInfo("Asia/Tashkent")
 #  Faqat raqamlarni almashtiring (lat = kenglik, lon = uzunlik).
 # ============================================================
 BRANCHES = [
-    {"name": "Haqqulobod", "lat": 40.914755, "lon": 72.114370},
-    {"name": "To'rtko'l", "lat": 40.885502, "lon": 72.185466},
+    {"name": "Haqqulobod", "lat": 40.900000, "lon": 71.700000},
+    {"name": "To'rtko'l", "lat": 41.550000, "lon": 61.000000},
 ]
 
 # Ruxsat etilgan masofa (metr). Ishchi shu masofadan yaqin bo'lsagina belgilay oladi.
-ALLOWED_RADIUS_M = int(os.getenv("ALLOWED_RADIUS_M", "20"))
+ALLOWED_RADIUS_M = int(os.getenv("ALLOWED_RADIUS_M", "200"))
 
 logging.basicConfig(level=logging.INFO)
 
@@ -84,6 +84,81 @@ def nearest_branch(lat, lon):
     return best, best_d
 
 
+def _round_arrival_hour(t):
+    """Kelgan vaqtni yuqoriga yaxlit soatga (soniya hisobga olinmaydi)."""
+    dt = datetime.strptime(t, "%H:%M:%S")
+    return dt.hour + 1 if dt.minute >= 1 else dt.hour
+
+
+def _round_departure_hour(t):
+    """Ketgan vaqt: daqiqa <=40 pastga, >=41 yuqoriga yaxlitlanadi."""
+    dt = datetime.strptime(t, "%H:%M:%S")
+    return dt.hour + 1 if dt.minute >= 41 else dt.hour
+
+
+def _is_morning(t):
+    dt = datetime.strptime(t, "%H:%M:%S")
+    return dt.hour < 11 or (dt.hour == 11 and dt.minute == 0)
+
+
+def rounded_work_hours(keldi, ketdi):
+    """Oylik uchun yaxlit ishlagan soat (butun son) yoki None."""
+    if not keldi:
+        return None
+    try:
+        a = _round_arrival_hour(keldi)
+        if ketdi:
+            d = _round_departure_hour(ketdi)
+        else:
+            d = 16 if _is_morning(keldi) else 24
+    except ValueError:
+        return None
+    w = d - a
+    return w if w >= 0 else 0
+
+
+def build_report_rows(attendance, employees):
+    """Davomat jurnalidan kunlik hisobot qatorlarini hosil qiladi."""
+    emp_map = {str(e.get("Telegram ID")): e for e in employees}
+    groups = {}
+    for r in attendance:
+        sana = str(r.get("Sana", "")).strip()
+        tg = str(r.get("Telegram ID", "")).strip()
+        vaqt = str(r.get("Vaqt", "")).strip()
+        if not sana or not tg:
+            continue
+        g = groups.setdefault((sana, tg), {"name": "", "keldi": [], "ketdi": []})
+        if r.get("Ism Familiya"):
+            g["name"] = r.get("Ism Familiya")
+        if r.get("Holat") == "Keldi" and vaqt:
+            g["keldi"].append(vaqt)
+        elif r.get("Holat") == "Ketdi" and vaqt:
+            g["ketdi"].append(vaqt)
+
+    rows = []
+    for (sana, tg), g in groups.items():
+        lavozim = emp_map.get(tg, {}).get("Lavozim", "")
+        keldi = min(g["keldi"]) if g["keldi"] else ""
+        ketdi = max(g["ketdi"]) if g["ketdi"] else ""
+        worked = ""
+        if keldi and ketdi:
+            try:
+                t1 = datetime.strptime(keldi, "%H:%M:%S")
+                t2 = datetime.strptime(ketdi, "%H:%M:%S")
+                diff = t2 - t1
+                if diff.total_seconds() < 0:
+                    diff = timedelta(0)
+                total_min = int(diff.total_seconds() // 60)
+                worked = f"{total_min // 60}:{total_min % 60:02d}"
+            except ValueError:
+                worked = ""
+        yaxlit = rounded_work_hours(keldi, ketdi)
+        yaxlit_txt = str(yaxlit) if yaxlit is not None else "—"
+        rows.append([sana, g["name"], lavozim, keldi or "—", ketdi or "—", worked or "—", yaxlit_txt])
+    rows.sort(key=lambda x: (x[0], x[1]))
+    return rows
+
+
 def main_kb(user_id: int) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="✅ Keldi"), KeyboardButton(text="🚪 Ketdi")],
@@ -91,7 +166,7 @@ def main_kb(user_id: int) -> ReplyKeyboardMarkup:
     ]
     if user_id == ADMIN_ID:
         rows.append([KeyboardButton(text="👥 Ishchilar"), KeyboardButton(text="📊 Bugungi davomat")])
-        rows.append([KeyboardButton(text="📢 Broadcast")])
+        rows.append([KeyboardButton(text="📅 Hisobot"), KeyboardButton(text="📢 Broadcast")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
@@ -303,6 +378,31 @@ async def davomat(message: Message):
             f"{r.get('Holat', '')}{branch_txt}"
         )
     await message.answer("\n".join(lines))
+
+
+# ------------------ Admin: hisobot ------------------
+@dp.message(Command("hisobot"))
+@dp.message(F.text == "📅 Hisobot")
+async def hisobot(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("Hisobot tayyorlanmoqda...")
+    attendance = await asyncio.to_thread(sheets.get_all_attendance)
+    employees = await asyncio.to_thread(sheets.get_employees)
+    rows = build_report_rows(attendance, employees)
+    if not rows:
+        await message.answer(
+            "Hozircha davomat ma'lumotlari yo'q.",
+            reply_markup=main_kb(message.from_user.id),
+        )
+        return
+    await asyncio.to_thread(sheets.update_report, rows)
+    await message.answer(
+        f"✅ <b>Hisobot</b> varag'i yangilandi ({len(rows)} qator).\n"
+        "Google Sheets'da «Hisobot» varag'ini oching — har bir ishchining "
+        "kunlik Keldi/Ketdi vaqti va ishlagan soati ko'rinadi.",
+        reply_markup=main_kb(message.from_user.id),
+    )
 
 
 # ------------------ Admin: broadcast ------------------
