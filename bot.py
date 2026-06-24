@@ -41,7 +41,7 @@ TZ = ZoneInfo("Asia/Tashkent")
 #  Faqat raqamlarni almashtiring (lat = kenglik, lon = uzunlik).
 # ============================================================
 BRANCHES = [
-    {"name": "Haqqulobod", "lat": 40.900000, "lon": 71.700000},
+    {"name": "Haqqulobod", "lat": 40.914755, "lon": 72.114370},
     {"name": "To'rtko'l", "lat": 41.550000, "lon": 61.000000},
 ]
 
