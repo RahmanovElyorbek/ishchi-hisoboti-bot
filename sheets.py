@@ -10,6 +10,7 @@ SCOPES = [
 
 ATT_HEADERS = ["Telegram ID", "Ism Familiya", "Holat", "Filial", "Masofa (m)", "Sana", "Vaqt"]
 EMP_HEADERS = ["Telegram ID", "Ism", "Familiya", "Lavozim", "Telefon", "Ro'yxatdan o'tgan sana"]
+HISOBOT_HEADERS = ["Sana", "Ism Familiya", "Lavozim", "Keldi", "Ketdi", "Ishlagan vaqti", "Yaxlit soat (oylik)"]
 
 
 class Sheets:
@@ -43,6 +44,19 @@ class Sheets:
 
     def get_today_attendance(self, date):
         return [r for r in self.attendance.get_all_records() if str(r.get("Sana")) == date]
+
+    def get_all_attendance(self):
+        return self.attendance.get_all_records()
+
+    def update_report(self, rows):
+        try:
+            ws = self.sh.worksheet("Hisobot")
+        except gspread.WorksheetNotFound:
+            ws = self.sh.add_worksheet(
+                title="Hisobot", rows=2000, cols=max(len(HISOBOT_HEADERS), 10)
+            )
+        ws.clear()
+        ws.update([HISOBOT_HEADERS] + rows, "A1")
 
     # --- Ishchilar ---
     def add_employee(self, tg_id, ism, familiya, lavozim, telefon, date):
