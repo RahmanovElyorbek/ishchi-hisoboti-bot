@@ -1,9 +1,10 @@
-"""Ishchilar davomat boti — aiogram 3.x + Google Sheets."""
+"""Ishchilar davomat boti — aiogram 3.x + Google Sheets + geolokatsiya."""
 
 import asyncio
 import logging
 import os
 from datetime import datetime
+from math import radians, sin, cos, asin, sqrt
 from zoneinfo import ZoneInfo
 
 from aiohttp import web
@@ -32,6 +33,21 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 CREDS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
 TZ = ZoneInfo("Asia/Tashkent")
 
+# ============================================================
+#  FILIALLAR — bu yerga HAR BIR filialning koordinatasini yozing.
+#  Koordinatani Google Maps'dan oling:
+#    - Telefonda: kerakli nuqtani bosib turing -> pastda lat, lon chiqadi
+#    - Kompyuterda: nuqtaga o'ng tugma -> birinchi qator (raqamlar) koordinata
+#  Faqat raqamlarni almashtiring (lat = kenglik, lon = uzunlik).
+# ============================================================
+BRANCHES = [
+    {"name": "Haqqulobod", "lat": 40.900000, "lon": 71.700000},
+    {"name": "To'rtko'l", "lat": 41.550000, "lon": 61.000000},
+]
+
+# Ruxsat etilgan masofa (metr). Ishchi shu masofadan yaqin bo'lsagina belgilay oladi.
+ALLOWED_RADIUS_M = int(os.getenv("ALLOWED_RADIUS_M", "200"))
+
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -48,6 +64,26 @@ def now_time() -> str:
     return datetime.now(TZ).strftime("%H:%M:%S")
 
 
+def distance_m(lat1, lon1, lat2, lon2) -> float:
+    """Ikki nuqta orasidagi masofa (metrda) — haversine formulasi."""
+    r = 6371000
+    p1, p2 = radians(lat1), radians(lat2)
+    dphi = radians(lat2 - lat1)
+    dlmb = radians(lon2 - lon1)
+    a = sin(dphi / 2) ** 2 + cos(p1) * cos(p2) * sin(dlmb / 2) ** 2
+    return 2 * r * asin(sqrt(a))
+
+
+def nearest_branch(lat, lon):
+    """Eng yaqin filial va unga masofani qaytaradi."""
+    best, best_d = None, None
+    for b in BRANCHES:
+        d = distance_m(lat, lon, b["lat"], b["lon"])
+        if best_d is None or d < best_d:
+            best, best_d = b, d
+    return best, best_d
+
+
 def main_kb(user_id: int) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="✅ Keldi"), KeyboardButton(text="🚪 Ketdi")],
@@ -59,11 +95,25 @@ def main_kb(user_id: int) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
+def location_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📍 Lokatsiyani yuborish", request_location=True)],
+            [KeyboardButton(text="❌ Bekor qilish")],
+        ],
+        resize_keyboard=True,
+    )
+
+
 class Reg(StatesGroup):
     ism = State()
     familiya = State()
     lavozim = State()
     telefon = State()
+
+
+class Attendance(StatesGroup):
+    waiting_location = State()
 
 
 class Broadcast(StatesGroup):
@@ -136,29 +186,83 @@ async def reg_telefon(message: Message, state: FSMContext):
     )
 
 
-# ------------------ Keldi / Ketdi ------------------
-async def mark(message: Message, status: str):
+# ------------------ Keldi / Ketdi (lokatsiya bilan) ------------------
+async def ask_location(message: Message, state: FSMContext, action: str):
     emp = await asyncio.to_thread(sheets.get_employee, message.from_user.id)
     if not emp:
         await message.answer("Avval ro'yxatdan o'ting: 📝 Ro'yxatdan o'tish")
         return
-    full_name = f"{emp.get('Ism', '')} {emp.get('Familiya', '')}".strip()
-    await asyncio.to_thread(
-        sheets.add_attendance, message.from_user.id, full_name, status, now_date(), now_time()
+    await state.set_state(Attendance.waiting_location)
+    await state.update_data(action=action)
+    await message.answer(
+        f"<b>{action}</b> belgilash uchun joylashuvingizni yuboring 👇\n"
+        "Pastdagi «📍 Lokatsiyani yuborish» tugmasini bosing.\n\n"
+        "<i>Eslatma: lokatsiya faqat telefon ilovasidan yuboriladi.</i>",
+        reply_markup=location_kb(),
     )
-    await message.answer(f"<b>{status}</b> belgilandi ✅\nVaqt: {now_time()}")
 
 
 @dp.message(Command("keldi"))
 @dp.message(F.text == "✅ Keldi")
-async def keldi(message: Message):
-    await mark(message, "Keldi")
+async def keldi(message: Message, state: FSMContext):
+    await ask_location(message, state, "Keldi")
 
 
 @dp.message(Command("ketdi"))
 @dp.message(F.text == "🚪 Ketdi")
-async def ketdi(message: Message):
-    await mark(message, "Ketdi")
+async def ketdi(message: Message, state: FSMContext):
+    await ask_location(message, state, "Ketdi")
+
+
+@dp.message(Attendance.waiting_location, F.location)
+async def got_location(message: Message, state: FSMContext):
+    data = await state.get_data()
+    action = data.get("action", "Keldi")
+    await state.clear()
+
+    lat = message.location.latitude
+    lon = message.location.longitude
+    branch, dist = nearest_branch(lat, lon)
+    dist_r = round(dist)
+
+    emp = await asyncio.to_thread(sheets.get_employee, message.from_user.id)
+    full_name = f"{emp.get('Ism', '')} {emp.get('Familiya', '')}".strip()
+
+    if dist <= ALLOWED_RADIUS_M:
+        await asyncio.to_thread(
+            sheets.add_attendance,
+            message.from_user.id, full_name, action,
+            branch["name"], dist_r, now_date(), now_time(),
+        )
+        await message.answer(
+            f"✅ <b>{action}</b> belgilandi!\n"
+            f"Filial: {branch['name']}\n"
+            f"Masofa: {dist_r} m\n"
+            f"Vaqt: {now_time()}",
+            reply_markup=main_kb(message.from_user.id),
+        )
+    else:
+        await message.answer(
+            f"❌ Siz ish joyidan uzoqdasiz.\n"
+            f"Eng yaqin filial: {branch['name']} — {dist_r} m.\n"
+            f"Faqat {ALLOWED_RADIUS_M} m masofada belgilash mumkin.\n\n"
+            "Ish joyiga yetib kelgach, qayta urinib ko'ring.",
+            reply_markup=main_kb(message.from_user.id),
+        )
+
+
+@dp.message(Attendance.waiting_location, F.text == "❌ Bekor qilish")
+async def loc_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Bekor qilindi.", reply_markup=main_kb(message.from_user.id))
+
+
+@dp.message(Attendance.waiting_location)
+async def loc_invalid(message: Message):
+    await message.answer(
+        "Iltimos, «📍 Lokatsiyani yuborish» tugmasi orqali joylashuv yuboring "
+        "yoki «❌ Bekor qilish» ni bosing."
+    )
 
 
 # ------------------ Admin: ishchilar ------------------
@@ -192,7 +296,12 @@ async def davomat(message: Message):
         return
     lines = [f"<b>Bugungi davomat ({now_date()}):</b>\n"]
     for r in rows:
-        lines.append(f"{r.get('Vaqt', '')} — {r.get('Ism Familiya', '')}: {r.get('Holat', '')}")
+        branch = r.get("Filial", "")
+        branch_txt = f" [{branch}]" if branch else ""
+        lines.append(
+            f"{r.get('Vaqt', '')} — {r.get('Ism Familiya', '')}: "
+            f"{r.get('Holat', '')}{branch_txt}"
+        )
     await message.answer("\n".join(lines))
 
 
@@ -227,7 +336,7 @@ async def broadcast_send(message: Message, state: FSMContext):
     )
 
 
-# ------------------ Render uchun kichik web-server (uxlab qolmasligi uchun) ------------------
+# ------------------ Render uchun kichik web-server ------------------
 async def health(request):
     return web.Response(text="Bot ishlayapti ✅")
 
