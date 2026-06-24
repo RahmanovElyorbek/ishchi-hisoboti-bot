@@ -46,7 +46,7 @@ BRANCHES = [
 ]
 
 # Ruxsat etilgan masofa (metr). Ishchi shu masofadan yaqin bo'lsagina belgilay oladi.
-ALLOWED_RADIUS_M = int(os.getenv("ALLOWED_RADIUS_M", "200"))
+ALLOWED_RADIUS_M = int(os.getenv("ALLOWED_RADIUS_M", "20"))
 
 logging.basicConfig(level=logging.INFO)
 
