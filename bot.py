@@ -7,6 +7,16 @@ from datetime import datetime, timedelta
 from math import radians, sin, cos, asin, sqrt
 from zoneinfo import ZoneInfo
 
+from aiogram.types import (
+    Message,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+)
+
 from aiohttp import web
 from dotenv import load_dotenv
 
@@ -87,6 +97,7 @@ def main_kb(user_id: int) -> ReplyKeyboardMarkup:
     if user_id == ADMIN_ID:
         rows.append([KeyboardButton(text="👥 Ishchilar"), KeyboardButton(text="📊 Bugungi davomat")])
         rows.append([KeyboardButton(text="📅 Hisobot"), KeyboardButton(text="📢 Broadcast")])
+        rows.append([KeyboardButton(text="📈 Oylik (ishchi bo'yicha)")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
@@ -165,6 +176,134 @@ def build_report_rows(attendance, employees):
     rows.sort(key=lambda x: (x[0], x[1]))
     return rows
 
+# ================== OYLIK — har bir ishchi alohida ==================
+def now_month() -> str:
+    return datetime.now(TZ).strftime("%Y-%m")
+
+
+def shift_month(ym: str, delta: int) -> str:
+    y, m = map(int, ym.split("-"))
+    m += delta
+    while m < 1:
+        m += 12; y -= 1
+    while m > 12:
+        m -= 12; y += 1
+    return f"{y:04d}-{m:02d}"
+
+
+def build_employee_month(attendance, tg_id, year_month):
+    """Bitta ishchining bitta oydagi kunlik davomati + jami soat."""
+    tg_id = str(tg_id)
+    groups = {}
+    for r in attendance:
+        if str(r.get("Telegram ID", "")).strip() != tg_id:
+            continue
+        sana = str(r.get("Sana", "")).strip()
+        if not sana.startswith(year_month):
+            continue
+        vaqt = str(r.get("Vaqt", "")).strip()
+        g = groups.setdefault(sana, {"keldi": [], "ketdi": []})
+        if r.get("Holat") == "Keldi" and vaqt:
+            g["keldi"].append(vaqt)
+        elif r.get("Holat") == "Ketdi" and vaqt:
+            g["ketdi"].append(vaqt)
+
+    days, total = [], 0
+    for sana in sorted(groups):
+        g = groups[sana]
+        keldi = min(g["keldi"]) if g["keldi"] else ""
+        ketdi = max(g["ketdi"]) if g["ketdi"] else ""
+        h = rounded_work_hours(keldi, ketdi)
+        if h:
+            total += h
+        days.append({"sana": sana, "keldi": keldi, "ketdi": ketdi, "soat": h})
+    return days, total
+
+
+def employees_kb(emps, year_month):
+    """Ishchilar ro'yxati — har biri inline tugma."""
+    kb = []
+    for e in emps:
+        name = f"{e.get('Ism', '')} {e.get('Familiya', '')}".strip() or "—"
+        tg = str(e.get("Telegram ID", ""))
+        kb.append([InlineKeyboardButton(text=name, callback_data=f"om|{tg}|{year_month}")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def month_nav_kb(tg_id, year_month):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="◀️", callback_data=f"om|{tg_id}|{shift_month(year_month, -1)}"),
+            InlineKeyboardButton(text=year_month, callback_data="om|noop"),
+            InlineKeyboardButton(text="▶️", callback_data=f"om|{tg_id}|{shift_month(year_month, 1)}"),
+        ],
+        [InlineKeyboardButton(text="🔙 Ishchilar ro'yxati", callback_data="om_back")],
+    ])
+
+
+def render_month_text(emps, tg_id, year_month, attendance):
+    name = "—"
+    for e in emps:
+        if str(e.get("Telegram ID")) == str(tg_id):
+            name = f"{e.get('Ism', '')} {e.get('Familiya', '')}".strip()
+            break
+    days, total = build_employee_month(attendance, tg_id, year_month)
+    lines = [f"📈 <b>{name}</b>", f"Oy: <b>{year_month}</b>\n"]
+    if not days:
+        lines.append("<i>Bu oyda davomat yo'q.</i>")
+    else:
+        for d in days:
+            dd = d["sana"][-2:]  # kun raqami
+            soat = f"{d['soat']} soat" if d["soat"] is not None else "—"
+            lines.append(f"{dd}: {d['keldi'] or '—'} → {d['ketdi'] or '—'}  ({soat})")
+        lines.append(f"\n<b>Jami:</b> {len(days)} kun · {total} soat")
+    return "\n".join(lines)
+
+
+@dp.message(Command("oylik"))
+@dp.message(F.text == "📈 Oylik (ishchi bo'yicha)")
+async def oylik_start(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    emps = await asyncio.to_thread(sheets.get_employees)
+    if not emps:
+        await message.answer("Hozircha ishchilar yo'q.")
+        return
+    await message.answer(
+        "Qaysi ishchining oylik davomatini ko'rasiz?",
+        reply_markup=employees_kb(emps, now_month()),
+    )
+
+
+@dp.callback_query(F.data == "om_back")
+async def oylik_back(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    emps = await asyncio.to_thread(sheets.get_employees)
+    await call.message.edit_text(
+        "Qaysi ishchining oylik davomatini ko'rasiz?",
+        reply_markup=employees_kb(emps, now_month()),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("om|"))
+async def oylik_show(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    parts = call.data.split("|")
+    if len(parts) != 3 or parts[1] == "noop":
+        await call.answer()
+        return
+    _, tg_id, ym = parts
+    await call.answer("Yuklanmoqda...")
+    attendance = await asyncio.to_thread(sheets.get_all_attendance)
+    emps = await asyncio.to_thread(sheets.get_employees)
+    text = render_month_text(emps, tg_id, ym, attendance)
+    try:
+        await call.message.edit_text(text, reply_markup=month_nav_kb(tg_id, ym))
+    except Exception:
+        pass  # "message is not modified" bo'lsa e'tibor bermaymiz    
 
 class Reg(StatesGroup):
     ism = State()
